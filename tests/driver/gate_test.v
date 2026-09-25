@@ -1,4 +1,4 @@
-// RUN: eqmap_fpga %s --assert-sat -n 40 -k 4 | FileCheck %s
+// RUN: eqmap_fpga %s --verify --assert-sat -n 40 -k 4 | FileCheck %s
 
 module gate_test (
     a,
@@ -70,31 +70,15 @@ module gate_test (
 endmodule
 
 // CHECK: module gate_test (
-// CHECK:   a,
-// CHECK:   b,
-// CHECK:   c,
-// CHECK:   d,
-// CHECK:   e,
-// CHECK:   f,
-// CHECK:   g,
-// CHECK:   y
+// CHECK:   input wire a,
+// CHECK:   input wire b,
+// CHECK:   input wire c,
+// CHECK:   input wire d,
+// CHECK:   input wire e,
+// CHECK:   input wire f,
+// CHECK:   input wire g,
+// CHECK:   output wire y
 // CHECK: );
-// CHECK:   input a;
-// CHECK:   wire a;
-// CHECK:   input b;
-// CHECK:   wire b;
-// CHECK:   input c;
-// CHECK:   wire c;
-// CHECK:   input d;
-// CHECK:   wire d;
-// CHECK:   input e;
-// CHECK:   wire e;
-// CHECK:   input f;
-// CHECK:   wire f;
-// CHECK:   input g;
-// CHECK:   wire g;
-// CHECK:   output y;
-// CHECK:   wire y;
 // CHECK:   wire __0__;
 // CHECK:   wire __1__;
 // CHECK:   wire __2__;

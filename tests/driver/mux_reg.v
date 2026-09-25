@@ -1,31 +1,15 @@
-// RUN: eqmap_fpga %s --assert-sat -k 4 | FileCheck %s
+// RUN: eqmap_fpga %s --verify --assert-sat -k 4 | FileCheck %s
 
 module mux_reg (
-    a,
-    b,
-    c,
-    clk,
-    d,
-    s0,
-    s1,
-    y
+    input  wire a,
+    input  wire b,
+    input  wire c,
+    input  wire clk,
+    input  wire d,
+    input  wire s0,
+    input  wire s1,
+    output wire y
 );
-  input a;
-  wire a;
-  input b;
-  wire b;
-  input c;
-  wire c;
-  input clk;
-  wire clk;
-  input d;
-  wire d;
-  input s0;
-  wire s0;
-  input s1;
-  wire s1;
-  output y;
-  wire y;
   wire tmp0;
   wire tmp1;
   wire tmp0_r;
@@ -85,31 +69,15 @@ module mux_reg (
 endmodule
 
 // CHECK: module mux_reg (
-// CHECK:   a,
-// CHECK:   b,
-// CHECK:   c,
-// CHECK:   clk,
-// CHECK:   d,
-// CHECK:   s0,
-// CHECK:   s1,
-// CHECK:   y
+// CHECK:   input wire a,
+// CHECK:   input wire b,
+// CHECK:   input wire c,
+// CHECK:   input wire clk,
+// CHECK:   input wire d,
+// CHECK:   input wire s0,
+// CHECK:   input wire s1,
+// CHECK:   output wire y
 // CHECK: );
-// CHECK:   input a;
-// CHECK:   wire a;
-// CHECK:   input b;
-// CHECK:   wire b;
-// CHECK:   input c;
-// CHECK:   wire c;
-// CHECK:   input clk;
-// CHECK:   wire clk;
-// CHECK:   input d;
-// CHECK:   wire d;
-// CHECK:   input s0;
-// CHECK:   wire s0;
-// CHECK:   input s1;
-// CHECK:   wire s1;
-// CHECK:   output y;
-// CHECK:   wire y;
 // CHECK:   wire __2__;
 // CHECK:   wire __3__;
 // CHECK:   wire __4__;

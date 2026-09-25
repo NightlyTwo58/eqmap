@@ -9,11 +9,14 @@ use eqmap::{
     rewrite::{all_static_rules, register_retiming},
     verilog::sv_parse_wrapper,
 };
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use nl_compiler::from_vast_overrides;
-use safety_net::Identifier;
+use safety_net::{
+    Identifier,
+    emitter::{VerilogEmitter, VerilogEmitterConfig},
+};
 use std::{
-    io::{Read, Write, stderr, stdin},
+    io::{Read, Write, stdin},
     path::PathBuf,
 };
 
@@ -56,9 +59,9 @@ struct Args {
     #[arg(short = 'a', long, default_value_t = false)]
     assert_sat: bool,
 
-    /// Do not verify the functionality of the output
-    #[arg(short = 'f', long, default_value_t = false)]
-    no_verify: bool,
+    /// Exhaustively verify the functionality of the output
+    #[arg(short = 'e', long, default_value_t = false)]
+    verify: bool,
 
     /// Do not canonicalize the input into LUTs
     #[arg(short = 'c', long, default_value_t = false)]
@@ -114,10 +117,14 @@ struct Args {
     /// Maximum number of rewrite iterations
     #[arg(short = 'n', long)]
     iter_limit: Option<usize>,
+
+    /// Emit the verilog in non-ANSI style
+    #[arg(long, default_value_t = false)]
+    non_ansi: bool,
 }
 
 fn xilinx_overrides(id: &Identifier, cell: &PrimitiveCell) -> Option<PrimitiveCell> {
-    if id.get_name() == "INV" {
+    if id.to_string() == "INV" {
         Some(
             cell.clone()
                 .remap_input(0, "I".into())
@@ -160,13 +167,23 @@ fn main() -> std::io::Result<()> {
     let ast = sv_parse_wrapper(&buf, path).map_err(std::io::Error::other)?;
 
     info!("Compiling Verilog...");
-    let f = from_vast_overrides(&ast, xilinx_overrides).map_err(std::io::Error::other)?;
+    let nls = from_vast_overrides(&ast, xilinx_overrides);
 
-    info!(
-        "Module {} has {} outputs",
-        f.get_name(),
-        f.get_output_ports().len()
-    );
+    let nls = match nls {
+        Ok(nls) => nls,
+        Err(e) => {
+            error!("{e}");
+            return Err(std::io::Error::other(e));
+        }
+    };
+
+    for f in &nls {
+        info!(
+            "Module {} has {} outputs",
+            f.get_name(),
+            f.get_output_ports().len()
+        );
+    }
 
     let mut rules = all_static_rules(false);
 
@@ -278,51 +295,74 @@ fn main() -> std::io::Result<()> {
         ));
     }
 
-    info!("Extracting logic...");
-    let mut mapper = f
-        .get_analysis::<LogicMapper<LutLang, PrimitiveCell>>()
-        .map_err(std::io::Error::other)?;
-
-    match args.partition {
-        PartitionMethod::R2R => {
-            mapper.insert_all_r2r().map_err(std::io::Error::other)?;
-        }
-        PartitionMethod::ArcSet => {
-            mapper.insert_partitioned().map_err(std::io::Error::other)?;
-        }
-        PartitionMethod::DelayPaths => todo!("Implement delay-based partitioning"),
+    if let Some(p) = &args.report {
+        std::fs::File::options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(p)?;
     }
 
-    let mut mapping = mapper.mappings();
-    let mapping = mapping.pop().unwrap();
-    let expr = mapping.get_expr();
+    for f in &nls {
+        info!("Extracting logic...");
+        let mut mapper = f
+            .get_analysis::<LogicMapper<LutLang, PrimitiveCell>>()
+            .map_err(std::io::Error::other)?;
 
-    info!("Building e-graph...");
-    let result = process_expression::<_, _, SynthReport>(expr, req, args.no_verify)?
-        .with_name(f.get_name().as_str());
+        match args.partition {
+            PartitionMethod::R2R => {
+                mapper.insert_all_r2r().map_err(std::io::Error::other)?;
+            }
+            PartitionMethod::ArcSet => {
+                mapper.insert_partitioned().map_err(std::io::Error::other)?;
+            }
+            PartitionMethod::DelayPaths => todo!("Implement delay-based partitioning"),
+        }
 
-    if let Some(p) = args.report {
-        let mut writer = std::fs::File::create(p)?;
-        result.write_report(&mut writer)?;
-        result.print_report(&mut stderr().lock())?;
+        let mut mapping = mapper.mappings();
+        let mapping = mapping.pop().unwrap();
+        let expr = mapping.get_expr();
+
+        info!("Building e-graph...");
+        let result = process_expression::<_, _, SynthReport>(expr, req.clone(), args.verify)?
+            .with_name(f.get_name().to_string().as_str());
+
+        if let Some(p) = &args.report {
+            let mut writer = std::fs::File::options().append(true).open(p)?;
+            result.write_report(&mut writer)?;
+            writeln!(writer)?;
+            result.info_report();
+        }
+
+        info!("Updating netlist...");
+        let mapping = mapping.with_expr(result.get_expr().to_owned());
+        mapping.rewrite(f).map_err(std::io::Error::other)?;
     }
 
-    info!("Writing output to Verilog...");
-    let mapping = mapping.with_expr(result.get_expr().to_owned());
-    mapping.rewrite(&f).map_err(std::io::Error::other)?;
+    info!("Writing Verilog...");
+    let config = VerilogEmitterConfig {
+        ansi_style: !args.non_ansi,
+        ..Default::default()
+    };
 
     if let Some(p) = args.output {
         let mut file = std::fs::File::create(p)?;
-        write!(
+        writeln!(
             file,
-            "/* Generated by {} {} */\n\n{}",
+            "/* Generated by {} {} */\n",
             env!("CARGO_PKG_NAME"),
-            env!("CARGO_PKG_VERSION"),
-            f
+            env!("CARGO_PKG_VERSION")
         )?;
+        for f in nls {
+            let emitter = VerilogEmitter::new(&f, config);
+            write!(file, "{emitter}")?;
+        }
         info!("Goodbye");
     } else {
-        print!("{f}");
+        for f in nls {
+            let emitter = VerilogEmitter::new(&f, config);
+            print!("{emitter}");
+        }
     }
 
     Ok(())

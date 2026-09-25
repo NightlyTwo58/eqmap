@@ -7,15 +7,16 @@
 use crate::asic::CellLang;
 use crate::driver::CircuitLang;
 use crate::lut::LutLang;
-use crate::verilog::PrimitiveType;
 use bitvec::field::BitField;
 use egg::{Id, RecExpr, Symbol};
 use nl_compiler::FromId;
+use safety_net::dont_touch_filter;
 use safety_net::graph::MultiDiGraph;
 use safety_net::{
     Analysis, DrivenNet, Error, Identifier, Instantiable, Logic, Net, Netlist, Parameter,
     format_id, iter::NetDFSIterator,
 };
+use safety_pass::CellType;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::str::FromStr;
@@ -280,7 +281,10 @@ impl<'a, L: CircuitLang, I: Instantiable + LogicFunc<L>> LogicMapper<'a, L, I> {
     }
 
     /// Map all logic to [CircuitLang] along register-to-register paths. This prevents register retiming.
-    pub fn insert_all_r2r(&mut self) -> Result<RecExpr<L>, String> {
+    pub fn insert_all_r2r(&mut self) -> Result<RecExpr<L>, String>
+    where
+        I: 'static,
+    {
         let mut nets: BTreeSet<DrivenNet<I>> = self
             ._netlist
             .outputs()
@@ -299,9 +303,16 @@ impl<'a, L: CircuitLang, I: Instantiable + LogicFunc<L>> LogicMapper<'a, L, I> {
             }
         }
 
+        let mut blocklist = HashSet::new();
+        for cell in dont_touch_filter(self._netlist) {
+            for output in cell.outputs() {
+                blocklist.insert(output);
+            }
+        }
+
         let nets: Vec<DrivenNet<I>> = nets.into_iter().collect();
 
-        self.insert_filtered(nets, |_| true, |i| !i.is_seq())
+        self.insert_filtered(nets, move |d| !blocklist.contains(d), |i| !i.is_seq())
     }
 
     /// Map all logic to [CircuitLang] using a greedy arc set to break cycles.
@@ -336,6 +347,12 @@ impl<'a, L: CircuitLang, I: Instantiable + LogicFunc<L>> LogicMapper<'a, L, I> {
             blocklist.insert(c.src());
         }
 
+        for cell in dont_touch_filter(self._netlist) {
+            for output in cell.outputs() {
+                blocklist.insert(output);
+            }
+        }
+
         let nets: Vec<DrivenNet<I>> = nets.into_iter().collect();
 
         self.insert_filtered(nets, move |d| !blocklist.contains(d), |_| true)
@@ -347,11 +364,11 @@ impl<'a, L: CircuitLang, I: Instantiable + LogicFunc<L>> LogicMapper<'a, L, I> {
     }
 }
 
-/// Create an instantiable cell out of the [PrimitiveType]
+/// Create an instantiable cell out of the [CellType]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrimitiveCell {
     name: Identifier,
-    ptype: PrimitiveType,
+    ptype: CellType,
     inputs: Vec<Net>,
     outputs: Vec<Net>,
     params: HashMap<Identifier, Parameter>,
@@ -359,7 +376,7 @@ pub struct PrimitiveCell {
 
 impl PrimitiveCell {
     /// Create a new primitive cell
-    pub fn new(ptype: PrimitiveType, size: Option<usize>) -> Self {
+    pub fn new(ptype: CellType, size: Option<usize>) -> Self {
         Self {
             name: if let Some(s) = size {
                 format_id!("{}_X{}", ptype, s)
@@ -368,11 +385,15 @@ impl PrimitiveCell {
             },
             ptype,
             inputs: ptype
-                .get_input_list()
+                .get_input_ports()
                 .into_iter()
-                .map(|s| Net::new_logic(Identifier::new(s)))
+                .map(Net::new_logic)
                 .collect(),
-            outputs: vec![Net::new_logic(Identifier::new(ptype.get_output()))],
+            outputs: ptype
+                .get_output_ports()
+                .into_iter()
+                .map(Net::new_logic)
+                .collect(),
             params: HashMap::new(),
         }
     }
@@ -390,6 +411,11 @@ impl PrimitiveCell {
         net.set_identifier(name);
         self
     }
+
+    /// Returns true if this cell is an inverter
+    pub fn is_inv(&self) -> bool {
+        self.ptype == CellType::INV || self.ptype == CellType::NOT
+    }
 }
 
 impl Instantiable for PrimitiveCell {
@@ -397,12 +423,12 @@ impl Instantiable for PrimitiveCell {
         &self.name
     }
 
-    fn get_input_ports(&self) -> impl IntoIterator<Item = &Net> {
-        self.inputs.iter()
+    fn get_input_ports(&self) -> &[Net] {
+        &self.inputs
     }
 
-    fn get_output_ports(&self) -> impl IntoIterator<Item = &Net> {
-        self.outputs.iter()
+    fn get_output_ports(&self) -> &[Net] {
+        &self.outputs
     }
 
     fn has_parameter(&self, id: &Identifier) -> bool {
@@ -417,28 +443,43 @@ impl Instantiable for PrimitiveCell {
         self.params.insert(id.clone(), val)
     }
 
-    fn parameters(&self) -> impl Iterator<Item = (Identifier, Parameter)> {
-        self.params.clone().into_iter()
+    fn clear_parameter(&mut self, id: &Identifier) -> Option<Parameter> {
+        self.params.remove(id)
+    }
+
+    fn parameters(&self) -> Vec<(Identifier, Parameter)> {
+        self.params.clone().into_iter().collect()
     }
 
     fn from_constant(val: Logic) -> Option<Self> {
         match val {
-            Logic::False => Some(PrimitiveCell::new(PrimitiveType::GND, None)),
-            Logic::True => Some(PrimitiveCell::new(PrimitiveType::VCC, None)),
+            Logic::False => Some(PrimitiveCell::new(CellType::GND, None)),
+            Logic::True => Some(PrimitiveCell::new(CellType::VCC, None)),
             _ => None,
         }
     }
 
     fn get_constant(&self) -> Option<Logic> {
         match self.ptype {
-            PrimitiveType::GND => Some(Logic::False),
-            PrimitiveType::VCC => Some(Logic::True),
+            CellType::GND => Some(Logic::False),
+            CellType::VCC => Some(Logic::True),
             _ => None,
         }
     }
 
     fn is_seq(&self) -> bool {
         self.ptype.is_reg()
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        if self.ptype.is_lut() && !self.has_parameter(&"INIT".into()) {
+            return Err(format!(
+                "LUT cell {} missing INIT parameter",
+                self.get_name()
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -449,11 +490,11 @@ impl LogicFunc<CellLang> for PrimitiveCell {
         }
 
         match self.ptype {
-            PrimitiveType::AND => Some(CellLang::And(children.try_into().ok()?)),
-            PrimitiveType::VCC => Some(CellLang::Const(true)),
-            PrimitiveType::GND => Some(CellLang::Const(false)),
-            PrimitiveType::OR => Some(CellLang::Or(children.try_into().ok()?)),
-            PrimitiveType::NOT => Some(CellLang::Inv(children.try_into().ok()?)),
+            CellType::AND => Some(CellLang::And(children.try_into().ok()?)),
+            CellType::VCC => Some(CellLang::Const(true)),
+            CellType::GND => Some(CellLang::Const(false)),
+            CellType::OR => Some(CellLang::Or(children.try_into().ok()?)),
+            CellType::NOT => Some(CellLang::Inv(children.try_into().ok()?)),
             _ if self.ptype.is_lut() => None,
             _ => Some(CellLang::Cell(
                 self.ptype.to_string().into(),
@@ -470,17 +511,17 @@ impl LogicFunc<LutLang> for PrimitiveCell {
         }
 
         match self.ptype {
-            PrimitiveType::AND => Some(LutLang::And(children.try_into().ok()?)),
-            PrimitiveType::VCC => Some(LutLang::Const(true)),
-            PrimitiveType::GND => Some(LutLang::Const(false)),
-            PrimitiveType::NOR => Some(LutLang::Nor(children.try_into().ok()?)),
-            PrimitiveType::XOR => Some(LutLang::Xor(children.try_into().ok()?)),
-            PrimitiveType::MUX => Some(LutLang::Mux(children.try_into().ok()?)),
-            PrimitiveType::NOT => Some(LutLang::Not(children.try_into().ok()?)),
-            PrimitiveType::FDRE => Some(LutLang::Fdre(children.try_into().ok()?)),
-            PrimitiveType::FDPE => Some(LutLang::Fdpe(children.try_into().ok()?)),
-            PrimitiveType::FDSE => Some(LutLang::Fdse(children.try_into().ok()?)),
-            PrimitiveType::FDCE => Some(LutLang::Fdce(children.try_into().ok()?)),
+            CellType::AND => Some(LutLang::And(children.try_into().ok()?)),
+            CellType::VCC => Some(LutLang::Const(true)),
+            CellType::GND => Some(LutLang::Const(false)),
+            CellType::NOR => Some(LutLang::Nor(children.try_into().ok()?)),
+            CellType::XOR => Some(LutLang::Xor(children.try_into().ok()?)),
+            CellType::MUX => Some(LutLang::Mux(children.try_into().ok()?)),
+            CellType::NOT => Some(LutLang::Not(children.try_into().ok()?)),
+            CellType::FDRE => Some(LutLang::Fdre(children.try_into().ok()?)),
+            CellType::FDPE => Some(LutLang::Fdpe(children.try_into().ok()?)),
+            CellType::FDSE => Some(LutLang::Fdse(children.try_into().ok()?)),
+            CellType::FDCE => Some(LutLang::Fdce(children.try_into().ok()?)),
             _ if self.ptype.is_lut() => Some(LutLang::Lut(children.into())),
             _ => None,
         }
@@ -560,11 +601,6 @@ impl<I: Instantiable + LogicFunc<L>, L: CircuitLang + LogicCell<I>> LogicMapping
                 continue;
             }
 
-            if !old.is_an_input() && old.is_top_level_output() {
-                let id = old.get_identifier() + "_overwritten".into();
-                old.as_net_mut().set_identifier(id);
-            }
-
             netlist.replace_net_uses(old, &new)?;
             new_roots.insert(new);
         }
@@ -580,11 +616,11 @@ impl<I: Instantiable + LogicFunc<L>, L: CircuitLang + LogicCell<I>> LogicMapping
 impl LogicCell<PrimitiveCell> for CellLang {
     fn get_cell(&self, params: &[(Identifier, Parameter)]) -> Option<PrimitiveCell> {
         let mut cell = match self {
-            CellLang::And(_) => PrimitiveCell::new(PrimitiveType::AND2, Some(1)),
-            CellLang::Or(_) => PrimitiveCell::new(PrimitiveType::OR2, Some(1)),
-            CellLang::Inv(_) => PrimitiveCell::new(PrimitiveType::INV, Some(1)),
+            CellLang::And(_) => PrimitiveCell::new(CellType::AND2, Some(1)),
+            CellLang::Or(_) => PrimitiveCell::new(CellType::OR2, Some(1)),
+            CellLang::Inv(_) => PrimitiveCell::new(CellType::INV, Some(1)),
             CellLang::Const(b) => PrimitiveCell::from_constant(Logic::from(*b))?,
-            CellLang::Cell(name, _) => match PrimitiveType::from_str(name.as_str()) {
+            CellLang::Cell(name, _) => match CellType::from_str(name.as_str()) {
                 Ok(ptype) => PrimitiveCell::new(ptype, Some(1)),
                 Err(_) => return None,
             },
@@ -602,26 +638,26 @@ impl LogicCell<PrimitiveCell> for CellLang {
 impl LogicCell<PrimitiveCell> for LutLang {
     fn get_cell(&self, params: &[(Identifier, Parameter)]) -> Option<PrimitiveCell> {
         let mut cell = match self {
-            LutLang::And(_) => PrimitiveCell::new(PrimitiveType::AND, None),
-            LutLang::Mux(_) => PrimitiveCell::new(PrimitiveType::MUX, None),
-            LutLang::Nor(_) => PrimitiveCell::new(PrimitiveType::NOR, None),
-            LutLang::Not(_) => PrimitiveCell::new(PrimitiveType::INV, None)
+            LutLang::And(_) => PrimitiveCell::new(CellType::AND, None),
+            LutLang::Mux(_) => PrimitiveCell::new(CellType::MUX, None),
+            LutLang::Nor(_) => PrimitiveCell::new(CellType::NOR, None),
+            LutLang::Not(_) => PrimitiveCell::new(CellType::INV, None)
                 .remap_input(0, "I".into())
                 .remap_output(0, "O".into()),
             LutLang::Const(b) => PrimitiveCell::from_constant(Logic::from(*b))?,
             LutLang::DC => PrimitiveCell::from_constant(Logic::X)?,
-            LutLang::Fdre(_) => PrimitiveCell::new(PrimitiveType::FDRE, None),
-            LutLang::Fdse(_) => PrimitiveCell::new(PrimitiveType::FDSE, None),
-            LutLang::Fdpe(_) => PrimitiveCell::new(PrimitiveType::FDPE, None),
-            LutLang::Fdce(_) => PrimitiveCell::new(PrimitiveType::FDCE, None),
-            LutLang::Xor(_) => PrimitiveCell::new(PrimitiveType::XOR, None),
+            LutLang::Fdre(_) => PrimitiveCell::new(CellType::FDRE, None),
+            LutLang::Fdse(_) => PrimitiveCell::new(CellType::FDSE, None),
+            LutLang::Fdpe(_) => PrimitiveCell::new(CellType::FDPE, None),
+            LutLang::Fdce(_) => PrimitiveCell::new(CellType::FDCE, None),
+            LutLang::Xor(_) => PrimitiveCell::new(CellType::XOR, None),
             LutLang::Lut(l) => match l.len() {
-                2 => PrimitiveCell::new(PrimitiveType::LUT1, None),
-                3 => PrimitiveCell::new(PrimitiveType::LUT2, None),
-                4 => PrimitiveCell::new(PrimitiveType::LUT3, None),
-                5 => PrimitiveCell::new(PrimitiveType::LUT4, None),
-                6 => PrimitiveCell::new(PrimitiveType::LUT5, None),
-                7 => PrimitiveCell::new(PrimitiveType::LUT6, None),
+                2 => PrimitiveCell::new(CellType::LUT1, None),
+                3 => PrimitiveCell::new(CellType::LUT2, None),
+                4 => PrimitiveCell::new(CellType::LUT3, None),
+                5 => PrimitiveCell::new(CellType::LUT4, None),
+                6 => PrimitiveCell::new(CellType::LUT5, None),
+                7 => PrimitiveCell::new(CellType::LUT6, None),
                 _ => return None,
             },
             _ => return None,
@@ -645,12 +681,20 @@ impl LogicCell<PrimitiveCell> for LutLang {
 
 impl FromId for PrimitiveCell {
     fn from_id(s: &Identifier) -> Result<Self, Error> {
-        match PrimitiveType::from_str(&s.to_string()) {
-            Ok(ptype) => Ok(PrimitiveCell::new(
-                ptype, None, /* Drop the size for logic synthesis */
-            )),
-            Err(e) => Err(Error::ParseError(e)),
-        }
+        let string = s.to_string();
+        let (cell, size) = match string.split_once("_X") {
+            Some((p, s)) => (p, Some(s)),
+            None => (string.as_str(), None),
+        };
+
+        let ctype = CellType::from_str(cell)?;
+        let size = match size {
+            Some(s) => Some(s.parse::<usize>().map_err(|_| {
+                safety_net::Error::ParseError(format!("Invalid size for cell {}: {}", cell, s))
+            })?),
+            None => None,
+        };
+        Ok(PrimitiveCell::new(ctype, size))
     }
 }
 
@@ -661,15 +705,15 @@ mod tests {
     use std::rc::Rc;
 
     fn and_gate() -> PrimitiveCell {
-        PrimitiveCell::new(PrimitiveType::AND, None)
+        PrimitiveCell::new(CellType::AND, None)
     }
 
     fn reg_cell() -> PrimitiveCell {
-        PrimitiveCell::new(PrimitiveType::FDRE, None)
+        PrimitiveCell::new(CellType::FDRE, None)
     }
 
     fn and_netlist() -> Rc<Netlist<PrimitiveCell>> {
-        let netlist = Netlist::new("example".to_string());
+        let netlist = Netlist::new("example".into());
 
         // Add the the two inputs
         let a = netlist.insert_input("a".into());
@@ -692,7 +736,7 @@ mod tests {
     }
 
     fn divider_netlist() -> Rc<Netlist<PrimitiveCell>> {
-        let netlist = Netlist::new("example".to_string());
+        let netlist = Netlist::new("example".into());
 
         // Add the the input
         let a = netlist.insert_input("a".into());
@@ -714,7 +758,7 @@ mod tests {
     }
 
     fn and_const_netlist() -> Rc<Netlist<PrimitiveCell>> {
-        let netlist = Netlist::new("example".to_string());
+        let netlist = Netlist::new("example".into());
 
         // Add the the two inputs
         let a = netlist.insert_constant(Logic::True, "a".into()).unwrap();
@@ -758,6 +802,26 @@ mod tests {
         assert!(l0.is_some());
         let l0 = l0.unwrap();
         assert_eq!(l0, netlist.first().unwrap().into());
+    }
+
+    #[test]
+    fn test_dont_touch_gate() {
+        let netlist = and_netlist();
+        let output = netlist.last().unwrap().get_output(0);
+
+        output
+            .clone()
+            .unwrap()
+            .set_attribute("dont_touch".to_string());
+
+        let mut mapper = netlist
+            .get_analysis::<'_, LogicMapper<'_, CellLang, _>>()
+            .unwrap();
+        let res = mapper.insert_all_r2r();
+        assert!(res.is_ok());
+        let res = res.unwrap();
+        // Basically an empty expr
+        assert_eq!(res.len(), 1);
     }
 
     #[test]
@@ -835,5 +899,14 @@ mod tests {
         let rewrite = mapping.rewrite(&netlist);
         assert!(rewrite.is_ok());
         assert!(netlist.objects().count() == 3);
+    }
+
+    #[test]
+    fn test_bad_lut() {
+        let mut lut = PrimitiveCell::new(CellType::LUT2, None);
+        assert!(!lut.has_parameter(&"INIT".into()));
+        assert!(lut.verify().is_err());
+        lut.set_parameter(&"INIT".into(), Parameter::bitvec(4, 0b1010));
+        assert!(lut.verify().is_ok());
     }
 }

@@ -8,13 +8,13 @@ use super::cost::NegativeCostFn;
 use super::lut::{CircuitStats, LutExprInfo, LutLang};
 #[cfg(feature = "graph_dumps")]
 use super::serialize::serialize_egraph;
-use super::verilog::PrimitiveType;
 use crate::cost::RandomExtract;
 use egg::{
     Analysis, BackoffScheduler, CostFunction, Explanation, Extractor, FromOpError, Language,
     RecExpr, RecExprParseError, Rewrite, Runner, StopReason, Symbol, TreeTerm,
 };
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use safety_pass::CellType;
 use simplelog::{ColorChoice, ConfigBuilder, TermLogger, TerminalMode};
 use std::collections::{BTreeMap, HashSet};
 use std::str::FromStr;
@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use log::{info, warn};
+use log::{error, info, warn};
 use serde::Serialize;
 use std::{
     io::{IsTerminal, Read, Write},
@@ -283,16 +283,19 @@ where
         Ok(())
     }
 
-    /// Print the report of the output in a human readable format.
-    pub fn print_report(&self, w: &mut impl Write) -> std::io::Result<()> {
-        writeln!(w, "INFO: Synthesis Report")?;
+    /// Print the report of the output to the info stream
+    pub fn info_report(&self) {
+        info!("Synthesis Report");
         if let Some(rpt) = &self.rpt {
-            let s = toml::to_string_pretty(rpt).map_err(std::io::Error::other)?;
-            for line in s.lines() {
-                writeln!(w, "INFO: {}", line)?;
+            match toml::to_string_pretty(rpt) {
+                Ok(s) => {
+                    for line in s.lines() {
+                        info!("{line}");
+                    }
+                }
+                Err(e) => error!("{e}"),
             }
         }
-        Ok(())
     }
 
     /// Write the report of the output to a string.
@@ -443,7 +446,7 @@ impl OptStrat {
         // list is a comma-deliminted string
         let gates: HashSet<String> = list.split(',').map(|s| s.to_string()).collect();
         for gate in &gates {
-            if PrimitiveType::from_str(gate).is_err() {
+            if CellType::from_str(gate).is_err() {
                 return Err(format!("Gate {gate} is not a valid cell type"));
             }
         }
@@ -774,7 +777,7 @@ where
         }
     }
 
-    /// Extract by disassembling into the logic gates in `list`. Elements in the list will be matched against [PrimitiveType::from_str].
+    /// Extract by disassembling into the logic gates in `list`. Elements in the list will be matched against [CellType::from_str].
     pub fn with_disassembly_into(self, list: &str) -> Result<Self, String> {
         Ok(Self {
             opt_strat: OptStrat::from_gate_set(list)?,
@@ -1277,14 +1280,14 @@ pub fn simple_reader(cmd: Option<String>, input_file: Option<PathBuf>) -> std::i
 pub fn process_expression<L, A, R>(
     expr: RecExpr<L>,
     req: SynthRequest<L, A>,
-    no_verify: bool,
+    verify: bool,
 ) -> std::io::Result<SynthOutput<L, R>>
 where
     L: CircuitLang,
     A: Analysis<L> + Clone + Default,
     R: Report<L>,
 {
-    if !no_verify {
+    if verify {
         L::verify_expr(&expr).map_err(std::io::Error::other)?;
     }
 
@@ -1322,7 +1325,7 @@ where
     let simplified = result.get_expr();
 
     // Verify functionality
-    if no_verify {
+    if !verify {
         info!("Skipping functionality tests...");
     } else {
         info!("Checking expression...");
@@ -1353,7 +1356,7 @@ where
 pub fn process_string_expression<L, A, R>(
     line: &str,
     req: SynthRequest<L, A>,
-    no_verify: bool,
+    verify: bool,
 ) -> std::io::Result<SynthOutput<L, R>>
 where
     L: CircuitLang,
@@ -1372,5 +1375,5 @@ where
     let expr = line.split("//").next().unwrap();
     let expr: RecExpr<L> = expr.parse().map_err(std::io::Error::other)?;
 
-    process_expression(expr, req, no_verify)
+    process_expression(expr, req, verify)
 }
